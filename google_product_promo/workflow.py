@@ -74,6 +74,15 @@ def _artifact_snapshot(run_dir):
         "audio_plan_json": str(run_dir / "audio_plan.json") if (run_dir / "audio_plan.json").is_file() else None,
         "audio_assets_json": str(run_dir / "audio_assets.json") if (run_dir / "audio_assets.json").is_file() else None,
         "final_with_audio_mp4": str(run_dir / "final_with_audio.mp4") if (run_dir / "final_with_audio.mp4").is_file() else None,
+        "alt_scenario_brief_json": str(run_dir / "alt_scenario_brief.json") if (run_dir / "alt_scenario_brief.json").is_file() else None,
+        "alt_image_prompts_json": str(run_dir / "alt_image_prompts.json") if (run_dir / "alt_image_prompts.json").is_file() else None,
+        "alt_candidates": [str(path) for path in sorted((run_dir / "alt_candidates").glob("candidate_*.png"))]
+        if (run_dir / "alt_candidates").is_dir()
+        else [],
+        "alt_image_rankings_json": str(run_dir / "alt_image_rankings.json") if (run_dir / "alt_image_rankings.json").is_file() else None,
+        "alt_selected_top3_json": str(run_dir / "alt_selected_top3.json") if (run_dir / "alt_selected_top3.json").is_file() else None,
+        "alt_video_prompt_txt": str(run_dir / "alt_video_prompt.txt") if (run_dir / "alt_video_prompt.txt").is_file() else None,
+        "alt_final_8s_mp4": str(run_dir / "alt_final_8s.mp4") if (run_dir / "alt_final_8s.mp4").is_file() else None,
         "transcript_jsonl": str(run_dir / "transcript.jsonl") if (run_dir / "transcript.jsonl").is_file() else None,
     }
 
@@ -124,7 +133,12 @@ def _next_tool_for_state(state):
         "AUDIO_PLAN_READY": "promo_generate_audio_assets",
         "AUDIO_ASSETS_PARTIAL": "promo_generate_audio_assets",
         "AUDIO_ASSETS_READY": "promo_merge_audio",
+        "ALT_SCENARIO_READY": "promo_alt_generate_candidate_images",
+        "ALT_IMAGES_READY": "promo_alt_rank_and_select_images",
+        "ALT_TOP3_READY": "promo_alt_generate_video_prompt",
+        "ALT_VIDEO_PROMPT_READY": "promo_alt_generate_8s_video",
         "FINAL_READY": None,
+        "ALT_VIDEO_READY": None,
     }
     return mapping.get(state)
 
@@ -879,3 +893,334 @@ def merge_audio(run_dir, *, music_file=None, narration_file=None, music_volume=0
     except Exception as exc:
         _record_step_failure(run_dir, "promo_merge_audio", exc)
         raise
+
+
+def generate_alt_scenario_and_image_prompts(run_dir, *, force=False):
+    run_dir = Path(run_dir)
+    config = load_json(run_dir / "config.json")
+    scenario_path = run_dir / "alt_scenario_brief.json"
+    prompts_path = run_dir / "alt_image_prompts.json"
+    if all(should_skip_output(path, force) for path in [scenario_path, prompts_path]):
+        state = update_run_state(run_dir)
+        return {"status": "skipped", "scenario_path": str(scenario_path), "prompts_path": str(prompts_path), "run_state": state}
+
+    client = build_client(config["project_id"], config["location"])
+    instruction = """
+You are creating an image-generation plan for a product promo.
+
+Inputs:
+- User campaign description
+- Three product reference images
+
+Tasks:
+1) Propose one coherent campaign scenario that best fits the product and user description.
+2) Generate 6 high-impact image prompts that preserve exact product identity.
+
+Rules:
+- Keep product identity exact: shape, material, logo placement, color, and signature details.
+- Prompts must be visually diverse but still belong to one coherent campaign world.
+- Prompts must be suitable for image generation input.
+- No text overlay instructions.
+- No markdown.
+
+Return strict JSON only:
+{
+  "scenario_brief": {
+    "theme": "string",
+    "setting": "string",
+    "lighting": "string",
+    "mood": "string",
+    "usage_context": "string",
+    "product_identity_constraints": ["string"],
+    "forbidden_drift": ["string"]
+  },
+  "image_prompts": [
+    {"id": 1, "intent": "hero", "prompt": "string"},
+    {"id": 2, "intent": "detail", "prompt": "string"},
+    {"id": 3, "intent": "lifestyle", "prompt": "string"},
+    {"id": 4, "intent": "action", "prompt": "string"},
+    {"id": 5, "intent": "dramatic", "prompt": "string"},
+    {"id": 6, "intent": "premium_close", "prompt": "string"}
+  ]
+}
+""".strip()
+    contents = [
+        instruction,
+        f"User description:\n{config['description']}",
+        "Product reference image 1:",
+        build_inline_image_part(config["product_images"][0]),
+        "Product reference image 2:",
+        build_inline_image_part(config["product_images"][1]),
+        "Product reference image 3:",
+        build_inline_image_part(config["product_images"][2]),
+    ]
+    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_scenario_and_image_prompts"})
+    response = client.models.generate_content(
+        model=config["prompt_model"],
+        contents=contents,
+        config={"response_mime_type": "application/json"},
+    )
+    raw_text = response_text(response)
+    if not raw_text:
+        raise RuntimeError("Scenario/prompt generation returned empty text.")
+    data = json.loads(raw_text)
+    scenario = data.get("scenario_brief")
+    prompts = data.get("image_prompts")
+    if not scenario or not isinstance(prompts, list) or len(prompts) != 6:
+        raise RuntimeError("Scenario/prompt JSON must include scenario_brief and 6 image_prompts.")
+    write_json(scenario_path, scenario)
+    write_json(prompts_path, {"prompts": prompts})
+    append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_alt_scenario_and_image_prompts"})
+    state = update_run_state(
+        run_dir,
+        state="ALT_SCENARIO_READY",
+        last_completed_step="promo_alt_generate_scenario_and_image_prompts",
+        last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
+    )
+    return {"status": "generated", "scenario_path": str(scenario_path), "prompts_path": str(prompts_path), "run_state": state}
+
+
+def generate_alt_candidate_images(run_dir, *, force=False):
+    run_dir = Path(run_dir)
+    config = load_json(run_dir / "config.json")
+    prompts_payload = load_json(run_dir / "alt_image_prompts.json")
+    prompts = prompts_payload["prompts"]
+    candidates_dir = run_dir / "alt_candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    seeds = [9101, 9102, 9103, 9104, 9105, 9106]
+    manifest = {"candidates": []}
+    for idx, prompt_item in enumerate(prompts, start=1):
+        output_path = candidates_dir / f"candidate_{idx}.png"
+        if should_skip_output(output_path, force):
+            manifest["candidates"].append(
+                {
+                    "id": idx,
+                    "intent": prompt_item.get("intent"),
+                    "prompt": prompt_item.get("prompt"),
+                    "path": str(output_path),
+                    "seed": seeds[idx - 1],
+                    "status": "skipped",
+                }
+            )
+            continue
+        _generate_anchor_image(run_dir, config, prompt_item["prompt"], config["product_images"], output_path, seeds[idx - 1])
+        manifest["candidates"].append(
+            {
+                "id": idx,
+                "intent": prompt_item.get("intent"),
+                "prompt": prompt_item.get("prompt"),
+                "path": str(output_path),
+                "seed": seeds[idx - 1],
+                "status": "generated",
+            }
+        )
+    manifest_path = run_dir / "alt_candidates_manifest.json"
+    write_json(manifest_path, manifest)
+    state = update_run_state(
+        run_dir,
+        state="ALT_IMAGES_READY",
+        last_completed_step="promo_alt_generate_candidate_images",
+        last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
+    )
+    return {"status": "generated", "manifest_path": str(manifest_path), "results": manifest["candidates"], "run_state": state}
+
+
+def _score_alt_candidate(run_dir, config, candidate_path):
+    client = build_client(config["project_id"], config["location"])
+    instruction = """
+Evaluate this generated product promo image against product reference images.
+
+Score each field from 0 to 100:
+- product_match
+- impact
+- clarity
+- visual_quality
+
+Return strict JSON only:
+{
+  "product_match": 0,
+  "impact": 0,
+  "clarity": 0,
+  "visual_quality": 0,
+  "reason": "string"
+}
+""".strip()
+    contents = [
+        instruction,
+        f"User description:\n{config['description']}",
+        "Product reference image 1:",
+        build_inline_image_part(config["product_images"][0]),
+        "Product reference image 2:",
+        build_inline_image_part(config["product_images"][1]),
+        "Product reference image 3:",
+        build_inline_image_part(config["product_images"][2]),
+        "Candidate image:",
+        build_inline_image_part(candidate_path),
+    ]
+    response = client.models.generate_content(
+        model=config["prompt_model"],
+        contents=contents,
+        config={"response_mime_type": "application/json"},
+    )
+    raw_text = response_text(response)
+    if not raw_text:
+        raise RuntimeError(f"Empty scoring response for {candidate_path}.")
+    data = json.loads(raw_text)
+    for key in ["product_match", "impact", "clarity", "visual_quality"]:
+        data[key] = max(0, min(100, int(data.get(key, 0))))
+    data["reason"] = str(data.get("reason", "")).strip()
+    return data
+
+
+def rank_and_select_alt_images(run_dir, *, force=False):
+    run_dir = Path(run_dir)
+    config = load_json(run_dir / "config.json")
+    rankings_path = run_dir / "alt_image_rankings.json"
+    selected_path = run_dir / "alt_selected_top3.json"
+    if all(should_skip_output(path, force) for path in [rankings_path, selected_path]):
+        state = update_run_state(run_dir)
+        return {"status": "skipped", "rankings_path": str(rankings_path), "selected_path": str(selected_path), "run_state": state}
+
+    manifest = load_json(run_dir / "alt_candidates_manifest.json")
+    weights = {
+        "product_match": 0.45,
+        "impact": 0.25,
+        "clarity": 0.20,
+        "visual_quality": 0.10,
+    }
+    scored = []
+    for item in manifest["candidates"]:
+        candidate_path = item["path"]
+        if not Path(candidate_path).is_file():
+            raise FileNotFoundError(f"Candidate image missing: {candidate_path}")
+        score = _score_alt_candidate(run_dir, config, candidate_path)
+        total = round(
+            score["product_match"] * weights["product_match"]
+            + score["impact"] * weights["impact"]
+            + score["clarity"] * weights["clarity"]
+            + score["visual_quality"] * weights["visual_quality"],
+            2,
+        )
+        scored.append(
+            {
+                "id": item["id"],
+                "path": candidate_path,
+                "intent": item.get("intent"),
+                "product_match": score["product_match"],
+                "impact": score["impact"],
+                "clarity": score["clarity"],
+                "visual_quality": score["visual_quality"],
+                "total": total,
+                "reason": score["reason"],
+            }
+        )
+    scored.sort(key=lambda x: x["total"], reverse=True)
+    top3 = [{"id": item["id"], "path": item["path"], "intent": item.get("intent"), "total": item["total"]} for item in scored[:3]]
+    write_json(rankings_path, {"weights": weights, "scores": scored})
+    write_json(selected_path, {"selected": top3})
+    state = update_run_state(
+        run_dir,
+        state="ALT_TOP3_READY",
+        last_completed_step="promo_alt_rank_and_select_images",
+        last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
+    )
+    return {"status": "generated", "rankings_path": str(rankings_path), "selected_path": str(selected_path), "selected": top3, "run_state": state}
+
+
+def generate_alt_video_prompt(run_dir, *, force=False):
+    run_dir = Path(run_dir)
+    config = load_json(run_dir / "config.json")
+    scenario = load_json(run_dir / "alt_scenario_brief.json")
+    selected = load_json(run_dir / "alt_selected_top3.json")
+    prompt_path = run_dir / "alt_video_prompt.txt"
+    meta_path = run_dir / "alt_video_prompt_meta.json"
+    if all(should_skip_output(path, force) for path in [prompt_path, meta_path]):
+        state = update_run_state(run_dir)
+        return {"status": "skipped", "prompt_path": str(prompt_path), "meta_path": str(meta_path), "run_state": state}
+
+    client = build_client(config["project_id"], config["location"])
+    instruction = (
+        "Write one concise Veo prompt for an 8-second vertical video. "
+        "The prompt must maximize product impact while preserving exact product identity. "
+        "Use the scenario brief and selected top-3 image intents. Return plain text only."
+    )
+    contents = [
+        instruction,
+        f"User description:\n{config['description']}",
+        f"Scenario brief JSON:\n{json.dumps(scenario, ensure_ascii=False)}",
+        f"Selected top-3 JSON:\n{json.dumps(selected, ensure_ascii=False)}",
+    ]
+    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt"})
+    response = client.models.generate_content(model=config["prompt_model"], contents=contents)
+    text = response_text(response)
+    if not text:
+        raise RuntimeError("Empty video prompt response.")
+    final_prompt = text.strip()
+    prompt_path.write_text(final_prompt + "\n", encoding="utf-8")
+    write_json(meta_path, {"model": config["prompt_model"], "prompt": final_prompt})
+    append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt", "text": final_prompt})
+    state = update_run_state(
+        run_dir,
+        state="ALT_VIDEO_PROMPT_READY",
+        last_completed_step="promo_alt_generate_video_prompt",
+        last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
+    )
+    return {"status": "generated", "prompt_path": str(prompt_path), "meta_path": str(meta_path), "prompt": final_prompt, "run_state": state}
+
+
+def _build_video_reference_image(path):
+    return types.VideoGenerationReferenceImage(image=build_image(path), reference_type="asset")
+
+
+def generate_alt_8s_video(run_dir, *, force=False):
+    run_dir = Path(run_dir)
+    config = load_json(run_dir / "config.json")
+    selected = load_json(run_dir / "alt_selected_top3.json")
+    prompt_path = run_dir / "alt_video_prompt.txt"
+    output_path = run_dir / "alt_final_8s.mp4"
+    if should_skip_output(output_path, force):
+        state = update_run_state(run_dir)
+        return {"status": "skipped", "path": str(output_path), "run_state": state}
+    if not prompt_path.is_file():
+        raise FileNotFoundError(f"Missing alt video prompt: {prompt_path}")
+    prompt = prompt_path.read_text(encoding="utf-8").strip()
+    selected_images = [item["path"] for item in selected.get("selected", [])]
+    if len(selected_images) != 3:
+        raise RuntimeError("alt_selected_top3.json must contain exactly 3 selected images.")
+    for path in selected_images:
+        require_file(path)
+
+    client = build_client(config["project_id"], config["location"])
+    append_transcript(run_dir, "llm_request", {"model": config["video_model"], "kind": "generate_alt_8s_video", "reference_images": selected_images})
+
+    def _call():
+        return client.models.generate_videos(
+            model=config["video_model"],
+            prompt=prompt,
+            config=types.GenerateVideosConfig(
+                reference_images=[_build_video_reference_image(path) for path in selected_images],
+                duration_seconds=8,
+                aspect_ratio=config["aspect_ratio"],
+                number_of_videos=1,
+                generate_audio=False,
+                resolution="1080p",
+            ),
+        )
+
+    operation = call_with_retry(_call, retries=4, initial_delay=20.0)
+    operation = poll_operation(client, operation)
+    error_obj = getattr(operation, "error", None)
+    if error_obj:
+        message = getattr(error_obj, "message", str(error_obj))
+        append_transcript(run_dir, "llm_response", {"model": config["video_model"], "kind": "generate_alt_8s_video", "error": message})
+        raise RuntimeError(f"Veo generation failed: {message}")
+    video_payload = extract_video_output(operation)
+    save_video_payload(video_payload, output_path)
+    append_transcript(run_dir, "llm_response", {"model": config["video_model"], "kind": "generate_alt_8s_video", "output_path": str(output_path)})
+    state = update_run_state(
+        run_dir,
+        state="ALT_VIDEO_READY",
+        last_completed_step="promo_alt_generate_8s_video",
+        last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
+    )
+    return {"status": "generated", "path": str(output_path), "duration_seconds": ffprobe_duration(output_path), "run_state": state}
