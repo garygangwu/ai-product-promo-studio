@@ -82,6 +82,7 @@ def _artifact_snapshot(run_dir):
         "alt_image_rankings_json": str(run_dir / "alt_image_rankings.json") if (run_dir / "alt_image_rankings.json").is_file() else None,
         "alt_selected_top3_json": str(run_dir / "alt_selected_top3.json") if (run_dir / "alt_selected_top3.json").is_file() else None,
         "alt_video_prompt_txt": str(run_dir / "alt_video_prompt.txt") if (run_dir / "alt_video_prompt.txt").is_file() else None,
+        "alt_video_prompt_review_json": str(run_dir / "alt_video_prompt_review.json") if (run_dir / "alt_video_prompt_review.json").is_file() else None,
         "alt_final_8s_mp4": str(run_dir / "alt_final_8s.mp4") if (run_dir / "alt_final_8s.mp4").is_file() else None,
         "transcript_jsonl": str(run_dir / "transcript.jsonl") if (run_dir / "transcript.jsonl").is_file() else None,
     }
@@ -1134,38 +1135,173 @@ def generate_alt_video_prompt(run_dir, *, force=False):
     selected = load_json(run_dir / "alt_selected_top3.json")
     prompt_path = run_dir / "alt_video_prompt.txt"
     meta_path = run_dir / "alt_video_prompt_meta.json"
-    if all(should_skip_output(path, force) for path in [prompt_path, meta_path]):
+    review_path = run_dir / "alt_video_prompt_review.json"
+    if all(should_skip_output(path, force) for path in [prompt_path, meta_path, review_path]):
         state = update_run_state(run_dir)
-        return {"status": "skipped", "prompt_path": str(prompt_path), "meta_path": str(meta_path), "run_state": state}
+        return {
+            "status": "skipped",
+            "prompt_path": str(prompt_path),
+            "meta_path": str(meta_path),
+            "review_path": str(review_path),
+            "run_state": state,
+        }
 
     client = build_client(config["project_id"], config["location"])
-    instruction = (
-        "Write one concise Veo prompt for an 8-second vertical video. "
-        "The prompt must maximize product impact while preserving exact product identity. "
-        "Use the scenario brief and selected top-3 image intents. Return plain text only."
+    draft_instruction = (
+        "Write one concise Veo prompt for an 8-second vertical product showcase video. "
+        "The prompt must maximize product impact and preserve exact product identity. "
+        "Use scenario and selected top images for style alignment. "
+        "Avoid product operation or manipulation actions. Focus on cinematic showcase only. "
+        "Return plain text only."
     )
-    contents = [
-        instruction,
+    draft_contents = [
+        draft_instruction,
         f"User description:\n{config['description']}",
         f"Scenario brief JSON:\n{json.dumps(scenario, ensure_ascii=False)}",
         f"Selected top-3 JSON:\n{json.dumps(selected, ensure_ascii=False)}",
     ]
-    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt"})
-    response = client.models.generate_content(model=config["prompt_model"], contents=contents)
-    text = response_text(response)
-    if not text:
+    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt_draft"})
+    response = client.models.generate_content(model=config["prompt_model"], contents=draft_contents)
+    draft_text = response_text(response)
+    if not draft_text:
         raise RuntimeError("Empty video prompt response.")
-    final_prompt = text.strip()
+    current_prompt = draft_text.strip()
+
+    critique_rounds = []
+    accepted_round = None
+    risk_threshold = 35
+
+    for round_idx in range(1, 4):
+        critique_instruction = """
+You are reviewing a product video prompt for operation-risk.
+
+Goal:
+- Keep the prompt product-agnostic and showcase-first.
+- Avoid any operation/manipulation/state-change actions on the product.
+
+Score operation risk from 0-100:
+- 0 means safe showcase-only wording.
+- 100 means high risk that the model will fail on product operation actions.
+
+Return strict JSON only:
+{
+  "operation_risk": 0,
+  "issues": ["string"],
+  "safe_rewrite": "string"
+}
+""".strip()
+        critique_contents = [
+            critique_instruction,
+            f"User description:\n{config['description']}",
+            f"Scenario brief JSON:\n{json.dumps(scenario, ensure_ascii=False)}",
+            f"Selected top-3 JSON:\n{json.dumps(selected, ensure_ascii=False)}",
+            f"Current prompt:\n{current_prompt}",
+        ]
+        append_transcript(
+            run_dir,
+            "llm_request",
+            {"model": config["prompt_model"], "kind": "generate_alt_video_prompt_critique", "round": round_idx, "prompt": current_prompt},
+        )
+        critique_response = client.models.generate_content(
+            model=config["prompt_model"],
+            contents=critique_contents,
+            config={"response_mime_type": "application/json"},
+        )
+        critique_raw = response_text(critique_response)
+        if not critique_raw:
+            raise RuntimeError("Prompt critique returned empty response.")
+        critique_data = json.loads(critique_raw)
+        operation_risk = max(0, min(100, int(critique_data.get("operation_risk", 100))))
+        issues = critique_data.get("issues") or []
+        if not isinstance(issues, list):
+            issues = [str(issues)]
+        safe_rewrite = str(critique_data.get("safe_rewrite", "")).strip()
+
+        critique_rounds.append(
+            {
+                "round": round_idx,
+                "operation_risk": operation_risk,
+                "issues": [str(item) for item in issues],
+                "prompt_in": current_prompt,
+                "safe_rewrite": safe_rewrite,
+            }
+        )
+
+        if operation_risk <= risk_threshold and current_prompt:
+            accepted_round = round_idx
+            break
+
+        if safe_rewrite:
+            current_prompt = safe_rewrite
+        else:
+            rewrite_instruction = """
+Rewrite this product video prompt to be showcase-only and product-agnostic.
+
+Rules:
+- No operation/manipulation/state-change actions on product.
+- Keep cinematic showcase style: framing, camera movement, lighting, detail emphasis.
+- Preserve product identity and premium impact.
+- Return plain text only.
+""".strip()
+            rewrite_contents = [
+                rewrite_instruction,
+                f"Current prompt:\n{current_prompt}",
+                f"Critique issues:\n{json.dumps(issues, ensure_ascii=False)}",
+            ]
+            rewrite_response = client.models.generate_content(model=config["prompt_model"], contents=rewrite_contents)
+            rewrite_text = response_text(rewrite_response)
+            if rewrite_text:
+                current_prompt = rewrite_text.strip()
+
+    final_prompt = current_prompt.strip()
+    if not final_prompt:
+        raise RuntimeError("Final alt video prompt is empty after critique loop.")
+
+    write_json(
+        review_path,
+        {
+            "model": config["prompt_model"],
+            "risk_threshold": risk_threshold,
+            "accepted_round": accepted_round,
+            "rounds": critique_rounds,
+            "final_prompt": final_prompt,
+        },
+    )
     prompt_path.write_text(final_prompt + "\n", encoding="utf-8")
-    write_json(meta_path, {"model": config["prompt_model"], "prompt": final_prompt})
-    append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt", "text": final_prompt})
+    write_json(
+        meta_path,
+        {
+            "model": config["prompt_model"],
+            "prompt": final_prompt,
+            "review_path": str(review_path),
+            "accepted_round": accepted_round,
+        },
+    )
+    append_transcript(
+        run_dir,
+        "llm_response",
+        {
+            "model": config["prompt_model"],
+            "kind": "generate_alt_video_prompt",
+            "text": final_prompt,
+            "accepted_round": accepted_round,
+            "operation_risk_final": critique_rounds[-1]["operation_risk"] if critique_rounds else None,
+        },
+    )
     state = update_run_state(
         run_dir,
         state="ALT_VIDEO_PROMPT_READY",
         last_completed_step="promo_alt_generate_video_prompt",
         last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
     )
-    return {"status": "generated", "prompt_path": str(prompt_path), "meta_path": str(meta_path), "prompt": final_prompt, "run_state": state}
+    return {
+        "status": "generated",
+        "prompt_path": str(prompt_path),
+        "meta_path": str(meta_path),
+        "review_path": str(review_path),
+        "prompt": final_prompt,
+        "run_state": state,
+    }
 
 
 def _build_video_reference_image(path):

@@ -20,9 +20,11 @@ def main():
     if result["status"] == "skipped":
         print(f"Skipping existing {result['prompt_path']}")
         print(f"Skipping existing {result['meta_path']}")
+        print(f"Skipping existing {result['review_path']}")
     else:
         print(f"Wrote {result['prompt_path']}")
         print(f"Wrote {result['meta_path']}")
+        print(f"Wrote {result['review_path']}")
 
 
 if __name__ == "__main__":
