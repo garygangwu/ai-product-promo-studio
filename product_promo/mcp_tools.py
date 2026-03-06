@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from google_product_promo import workflow
+from product_promo import workflow
 
 
 def _resolve_run_dir(arguments):
@@ -56,6 +56,11 @@ def handle_create_run(arguments):
         location=arguments.get("location", workflow.DEFAULT_LOCATION),
         aspect_ratio=arguments.get("aspect_ratio", workflow.DEFAULT_ASPECT_RATIO),
         audio_theme=arguments.get("audio_theme", workflow.DEFAULT_AUDIO_THEME),
+        llm_provider=arguments.get("llm_provider", "openai"),
+        llm_model_prompt=arguments.get("llm_model_prompt", "gpt-5"),
+        llm_provider_prompt=arguments.get("llm_provider_prompt"),
+        llm_provider_qa=arguments.get("llm_provider_qa"),
+        llm_model_qa=arguments.get("llm_model_qa"),
     )
     return _base_response(
         result["run_dir"],
@@ -196,6 +201,11 @@ TOOL_DEFINITIONS = [
                 "description": {"type": "string"},
                 "aspect_ratio": {"type": "string"},
                 "audio_theme": {"type": "string"},
+                "llm_provider": {"type": "string", "enum": ["google", "openai"]},
+                "llm_provider_prompt": {"type": "string", "enum": ["google", "openai"]},
+                "llm_provider_qa": {"type": "string", "enum": ["google", "openai"]},
+                "llm_model_prompt": {"type": "string"},
+                "llm_model_qa": {"type": "string"},
             },
         },
     },

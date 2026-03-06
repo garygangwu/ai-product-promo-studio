@@ -1,16 +1,16 @@
 ---
-name: google-product-promo-workflow
-description: Operate the Google product promo workflow through MCP tools. Use this when creating, resuming, inspecting, retrying, or repairing multi-step product promo runs that generate anchor plans, anchor images, bridge videos, audio plans, audio assets, and final merged videos.
+name: product-promo-workflow
+description: Operate the product promo workflow through MCP tools. Use this when creating, resuming, inspecting, retrying, or repairing multi-step product promo runs that generate anchor plans, anchor images, bridge videos, audio plans, audio assets, and final merged videos.
 ---
 
-# Google Product Promo Workflow
+# Product Promo Workflow
 
 Use this skill when the user wants to run or recover the promo pipeline through MCP tools instead of manually invoking step scripts.
 
 ## Core Policy
 
-- Prefer MCP tools over shelling into `google_product_promo/step_*.py`.
-- Treat each run directory under `google_product_promo/runs/` as the source of truth.
+- Prefer MCP tools over shelling into `product_promo/step_*.py`.
+- Treat each run directory under `product_promo/runs/` as the source of truth.
 - Always inspect an existing run with `promo_get_run` before choosing the next action.
 - Prefer resuming a run over recreating it.
 - Do not rerun expensive completed steps unless the user explicitly asks or the artifact is missing or invalid.

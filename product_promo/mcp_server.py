@@ -5,7 +5,7 @@ from traceback import format_exc
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_product_promo.mcp_tools import call_tool, list_tools
+from product_promo.mcp_tools import call_tool, list_tools
 
 
 def _write_response(payload):

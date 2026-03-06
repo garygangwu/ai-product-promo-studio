@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_product_promo.workflow import generate_alt_scenario_and_image_prompts
+from product_promo.workflow import generate_alt_scenario_and_image_prompts
 
 
 def parse_args():

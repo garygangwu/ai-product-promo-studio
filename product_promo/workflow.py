@@ -11,7 +11,7 @@ import google.auth
 from google.auth.transport.requests import Request
 from google.genai import types
 
-from google_product_promo.common import (
+from product_promo.common import (
     DEFAULT_ASPECT_RATIO,
     DEFAULT_AUDIO_THEME,
     DEFAULT_LOCATION,
@@ -36,12 +36,12 @@ from google_product_promo.common import (
     poll_operation,
     require_file,
     resolve_model_name,
-    response_text,
     save_inline_image,
     save_video_payload,
     should_skip_output,
     write_json,
 )
+from product_promo.llm_gateway import build_llm_gateway
 
 
 LYRIA_MODEL = "lyria-002"
@@ -82,7 +82,14 @@ def _artifact_snapshot(run_dir):
         "alt_image_rankings_json": str(run_dir / "alt_image_rankings.json") if (run_dir / "alt_image_rankings.json").is_file() else None,
         "alt_selected_top3_json": str(run_dir / "alt_selected_top3.json") if (run_dir / "alt_selected_top3.json").is_file() else None,
         "alt_video_prompt_txt": str(run_dir / "alt_video_prompt.txt") if (run_dir / "alt_video_prompt.txt").is_file() else None,
+        "alt_video_prompt_contract_json": str(run_dir / "alt_video_prompt_contract.json")
+        if (run_dir / "alt_video_prompt_contract.json").is_file()
+        else None,
         "alt_video_prompt_review_json": str(run_dir / "alt_video_prompt_review.json") if (run_dir / "alt_video_prompt_review.json").is_file() else None,
+        "alt_video_candidates": [str(path) for path in sorted((run_dir / "alt_video_candidates").glob("candidate_*.mp4"))]
+        if (run_dir / "alt_video_candidates").is_dir()
+        else [],
+        "alt_video_qa_json": str(run_dir / "alt_video_qa.json") if (run_dir / "alt_video_qa.json").is_file() else None,
         "alt_final_8s_mp4": str(run_dir / "alt_final_8s.mp4") if (run_dir / "alt_final_8s.mp4").is_file() else None,
         "transcript_jsonl": str(run_dir / "transcript.jsonl") if (run_dir / "transcript.jsonl").is_file() else None,
     }
@@ -221,6 +228,8 @@ def get_run_status(run_dir):
     state_path = _run_state_path(run_dir)
     if state_path.is_file():
         state = load_json(state_path)
+        state["run_id"] = run_dir.name
+        state["run_dir"] = str(run_dir.resolve())
         state["artifacts"] = _artifact_snapshot(run_dir)
         state["next_recommended_tool"] = _next_tool_for_state(state["state"]) if state["state"] != "FAILED" else None
         return state
@@ -247,6 +256,24 @@ def list_runs(runs_dir=RUNS_DIR):
     return results
 
 
+def _llm_provider_for(config, purpose):
+    if purpose == "qa":
+        return config.get("llm_provider_qa") or config.get("llm_provider_prompt") or config.get("llm_provider", "google")
+    return config.get("llm_provider_prompt") or config.get("llm_provider", "google")
+
+
+def _llm_model_for(config, purpose):
+    if purpose == "qa":
+        return config.get("llm_model_qa") or config.get("qa_model") or config.get("llm_model_prompt") or config["prompt_model"]
+    return config.get("llm_model_prompt") or config["prompt_model"]
+
+
+def _llm_for(config, purpose):
+    provider = _llm_provider_for(config, purpose)
+    model = _llm_model_for(config, purpose)
+    return build_llm_gateway(config, provider=provider), model
+
+
 def create_run(
     *,
     product_images,
@@ -257,6 +284,11 @@ def create_run(
     location=DEFAULT_LOCATION,
     aspect_ratio=DEFAULT_ASPECT_RATIO,
     audio_theme=DEFAULT_AUDIO_THEME,
+    llm_provider="openai",
+    llm_model_prompt=None,
+    llm_provider_prompt=None,
+    llm_provider_qa=None,
+    llm_model_qa=None,
 ):
     for path in product_images:
         require_file(path)
@@ -266,6 +298,12 @@ def create_run(
     run_dir = ensure_run_dir(RUNS_DIR / resolved_run_id)
     try:
         available_models = list_available_models(project_id, location)
+        provider = str(llm_provider or "openai").strip().lower()
+        provider_prompt = str(llm_provider_prompt or provider).strip().lower()
+        provider_qa = str(llm_provider_qa or provider_prompt).strip().lower()
+        default_google_prompt_model = resolve_model_name(available_models, PROMPT_MODEL_CANDIDATES, "prompt")
+        model_prompt = llm_model_prompt or ("gpt-5" if provider_prompt == "openai" else default_google_prompt_model)
+        model_qa = llm_model_qa or model_prompt
         config = {
             "run_id": resolved_run_id,
             "run_dir": str(run_dir.resolve()),
@@ -276,9 +314,15 @@ def create_run(
             "description": description,
             "aspect_ratio": aspect_ratio,
             "audio_theme": audio_theme,
-            "prompt_model": resolve_model_name(available_models, PROMPT_MODEL_CANDIDATES, "prompt"),
+            "prompt_model": model_prompt,
+            "qa_model": model_qa,
             "image_model": resolve_model_name(available_models, IMAGE_MODEL_CANDIDATES, "image"),
             "video_model": resolve_model_name(available_models, VIDEO_MODEL_CANDIDATES, "video"),
+            "llm_provider": provider,
+            "llm_provider_prompt": provider_prompt,
+            "llm_provider_qa": provider_qa,
+            "llm_model_prompt": model_prompt,
+            "llm_model_qa": model_qa,
         }
         write_json(run_dir / "available_models.json", {"models": available_models})
         write_json(run_dir / "config.json", config)
@@ -304,7 +348,7 @@ def generate_anchor_plan(run_dir, *, force=False):
             state = update_run_state(run_dir)
             return {"status": "skipped", "path": str(output_path), "run_state": state}
 
-        client = build_client(config["project_id"], config["location"])
+        llm, llm_model = _llm_for(config, "prompt")
         instruction = """
 You are planning a four-image product promo campaign.
 
@@ -407,7 +451,7 @@ Additional prompt-writing rules:
             run_dir,
             "llm_request",
             {
-                "model": config["prompt_model"],
+                "model": llm_model,
                 "kind": "generate_anchor_plan",
                 "text": instruction,
                 "description": config["description"],
@@ -415,12 +459,12 @@ Additional prompt-writing rules:
                 "logo_image": config["logo_image"],
             },
         )
-        response = client.models.generate_content(
-            model=config["prompt_model"],
+        response = llm.generate_content(
+            model=llm_model,
             contents=contents,
             config={"response_mime_type": "application/json"},
         )
-        raw_text = response_text(response)
+        raw_text = llm.extract_text(response)
         cleaned = (raw_text or "").strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -430,15 +474,15 @@ Additional prompt-writing rules:
             if match:
                 cleaned = match.group(0)
         if not cleaned:
-            append_transcript(run_dir, "anchor_plan_parse_error", {"model": config["prompt_model"], "raw_text": raw_text, "response_repr": str(response)})
+            append_transcript(run_dir, "anchor_plan_parse_error", {"model": llm_model, "raw_text": raw_text, "response_repr": str(response)})
             raise RuntimeError("Prompt model returned empty or non-text output. Check transcript.jsonl for details.")
         try:
             anchor_plan = json.loads(cleaned)
         except json.JSONDecodeError as exc:
-            append_transcript(run_dir, "anchor_plan_parse_error", {"model": config["prompt_model"], "raw_text": raw_text, "cleaned_text": cleaned, "error": str(exc)})
+            append_transcript(run_dir, "anchor_plan_parse_error", {"model": llm_model, "raw_text": raw_text, "cleaned_text": cleaned, "error": str(exc)})
             raise RuntimeError("Prompt model returned invalid JSON. Check transcript.jsonl for the raw output.") from exc
         write_json(output_path, anchor_plan)
-        append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_anchor_plan", "text": raw_text})
+        append_transcript(run_dir, "llm_response", {"model": llm_model, "kind": "generate_anchor_plan", "text": raw_text})
         state = _record_step_success(run_dir, "promo_generate_anchor_plan")
         return {"status": "generated", "path": str(output_path), "anchor_plan": anchor_plan, "run_state": state}
     except Exception as exc:
@@ -447,7 +491,7 @@ Additional prompt-writing rules:
 
 
 def _generate_anchor_image(run_dir, config, prompt, reference_paths, output_path, seed):
-    client = build_client(config["project_id"], config["location"])
+    llm = build_llm_gateway(config)
     contents = [build_inline_image_part(path) for path in reference_paths]
     contents.append(
         f"Use all reference images to preserve the exact same product identity. {prompt} "
@@ -460,7 +504,7 @@ def _generate_anchor_image(run_dir, config, prompt, reference_paths, output_path
     )
 
     def _call():
-        return client.models.generate_content(
+        return llm.generate_content(
             model=config["image_model"],
             contents=contents,
             config=types.GenerateContentConfig(
@@ -472,7 +516,7 @@ def _generate_anchor_image(run_dir, config, prompt, reference_paths, output_path
 
     response = call_with_retry(_call, retries=5, initial_delay=20.0)
     save_inline_image(response, output_path)
-    append_transcript(run_dir, "llm_response", {"model": config["image_model"], "kind": "generate_anchor_image", "output_path": str(output_path), "text": response_text(response)})
+    append_transcript(run_dir, "llm_response", {"model": config["image_model"], "kind": "generate_anchor_image", "output_path": str(output_path), "text": llm.extract_text(response)})
 
 
 def generate_anchor_images(run_dir, *, force=False):
@@ -625,7 +669,7 @@ def generate_audio_plan(run_dir, *, force=False):
             state = update_run_state(run_dir)
             return {"status": "skipped", "path": str(output_json), "run_state": state}
 
-        client = build_client(config["project_id"], config["location"])
+        llm, llm_model = _llm_for(config, "prompt")
         instruction = f"""
 You are planning the audio for a product promo video.
 
@@ -688,9 +732,9 @@ Final video duration seconds:
 Anchor plan JSON:
 {json.dumps(anchor_plan, ensure_ascii=False)}
 """.strip()
-        append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_audio_plan", "text": instruction})
-        response = client.models.generate_content(model=config["prompt_model"], contents=instruction, config={"response_mime_type": "application/json"})
-        raw_text = response_text(response)
+        append_transcript(run_dir, "llm_request", {"model": llm_model, "kind": "generate_audio_plan", "text": instruction})
+        response = llm.generate_content(model=llm_model, contents=instruction, config={"response_mime_type": "application/json"})
+        raw_text = llm.extract_text(response)
         cleaned = (raw_text or "").strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
@@ -709,7 +753,7 @@ Anchor plan JSON:
         write_json(legacy_narration_json, script_payload["narration"])
         output_txt.write_text(script_payload["narration"]["full_script"].strip() + "\n", encoding="utf-8")
         music_prompt_txt.write_text(script_payload["music"]["generation_prompt_safe"].strip() + "\n", encoding="utf-8")
-        append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_audio_plan", "text": raw_text})
+        append_transcript(run_dir, "llm_response", {"model": llm_model, "kind": "generate_audio_plan", "text": raw_text})
         state = _record_step_success(run_dir, "promo_generate_audio_plan")
         return {"status": "generated", "path": str(output_json), "audio_plan": script_payload, "run_state": state}
     except Exception as exc:
@@ -905,7 +949,7 @@ def generate_alt_scenario_and_image_prompts(run_dir, *, force=False):
         state = update_run_state(run_dir)
         return {"status": "skipped", "scenario_path": str(scenario_path), "prompts_path": str(prompts_path), "run_state": state}
 
-    client = build_client(config["project_id"], config["location"])
+    llm, llm_model = _llm_for(config, "prompt")
     instruction = """
 You are creating an image-generation plan for a product promo.
 
@@ -955,13 +999,13 @@ Return strict JSON only:
         "Product reference image 3:",
         build_inline_image_part(config["product_images"][2]),
     ]
-    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_scenario_and_image_prompts"})
-    response = client.models.generate_content(
-        model=config["prompt_model"],
+    append_transcript(run_dir, "llm_request", {"model": llm_model, "kind": "generate_alt_scenario_and_image_prompts"})
+    response = llm.generate_content(
+        model=llm_model,
         contents=contents,
         config={"response_mime_type": "application/json"},
     )
-    raw_text = response_text(response)
+    raw_text = llm.extract_text(response)
     if not raw_text:
         raise RuntimeError("Scenario/prompt generation returned empty text.")
     data = json.loads(raw_text)
@@ -971,7 +1015,7 @@ Return strict JSON only:
         raise RuntimeError("Scenario/prompt JSON must include scenario_brief and 6 image_prompts.")
     write_json(scenario_path, scenario)
     write_json(prompts_path, {"prompts": prompts})
-    append_transcript(run_dir, "llm_response", {"model": config["prompt_model"], "kind": "generate_alt_scenario_and_image_prompts"})
+    append_transcript(run_dir, "llm_response", {"model": llm_model, "kind": "generate_alt_scenario_and_image_prompts"})
     state = update_run_state(
         run_dir,
         state="ALT_SCENARIO_READY",
@@ -1027,7 +1071,7 @@ def generate_alt_candidate_images(run_dir, *, force=False):
 
 
 def _score_alt_candidate(run_dir, config, candidate_path):
-    client = build_client(config["project_id"], config["location"])
+    llm, llm_model = _llm_for(config, "qa")
     instruction = """
 Evaluate this generated product promo image against product reference images.
 
@@ -1058,12 +1102,12 @@ Return strict JSON only:
         "Candidate image:",
         build_inline_image_part(candidate_path),
     ]
-    response = client.models.generate_content(
-        model=config["prompt_model"],
+    response = llm.generate_content(
+        model=llm_model,
         contents=contents,
         config={"response_mime_type": "application/json"},
     )
-    raw_text = response_text(response)
+    raw_text = llm.extract_text(response)
     if not raw_text:
         raise RuntimeError(f"Empty scoring response for {candidate_path}.")
     data = json.loads(raw_text)
@@ -1135,37 +1179,69 @@ def generate_alt_video_prompt(run_dir, *, force=False):
     selected = load_json(run_dir / "alt_selected_top3.json")
     prompt_path = run_dir / "alt_video_prompt.txt"
     meta_path = run_dir / "alt_video_prompt_meta.json"
+    contract_path = run_dir / "alt_video_prompt_contract.json"
     review_path = run_dir / "alt_video_prompt_review.json"
-    if all(should_skip_output(path, force) for path in [prompt_path, meta_path, review_path]):
+    if all(should_skip_output(path, force) for path in [prompt_path, meta_path, contract_path, review_path]):
         state = update_run_state(run_dir)
         return {
             "status": "skipped",
             "prompt_path": str(prompt_path),
             "meta_path": str(meta_path),
+            "contract_path": str(contract_path),
             "review_path": str(review_path),
             "run_state": state,
         }
 
-    client = build_client(config["project_id"], config["location"])
-    draft_instruction = (
-        "Write one concise Veo prompt for an 8-second vertical product showcase video. "
-        "The prompt must maximize product impact and preserve exact product identity. "
-        "Use scenario and selected top images for style alignment. "
-        "Avoid product operation or manipulation actions. Focus on cinematic showcase only. "
-        "Return plain text only."
-    )
+    llm, llm_model = _llm_for(config, "prompt")
+    selected_images = [item["path"] for item in selected.get("selected", [])]
+    if len(selected_images) != 3:
+        raise RuntimeError("alt_selected_top3.json must contain exactly 3 selected images.")
+    for path in selected_images:
+        require_file(path)
+    draft_instruction = """
+Create an 8-second Veo vertical showcase prompt with strict reference consistency.
+
+Use the selected reference images directly. Infer spatial/orientation constraints from them.
+No product operation/manipulation actions.
+
+Return strict JSON only:
+{
+  "video_prompt": "string",
+  "consistency_contract": {
+    "orientation_constraints": ["string"],
+    "asymmetry_markers": ["string"],
+    "must_preserve_features": ["string"],
+    "forbidden_transforms": ["mirror", "horizontal_flip", "left_right_swap"]
+  }
+}
+""".strip()
     draft_contents = [
         draft_instruction,
         f"User description:\n{config['description']}",
         f"Scenario brief JSON:\n{json.dumps(scenario, ensure_ascii=False)}",
         f"Selected top-3 JSON:\n{json.dumps(selected, ensure_ascii=False)}",
+        "Selected reference image 1:",
+        build_inline_image_part(selected_images[0]),
+        "Selected reference image 2:",
+        build_inline_image_part(selected_images[1]),
+        "Selected reference image 3:",
+        build_inline_image_part(selected_images[2]),
     ]
-    append_transcript(run_dir, "llm_request", {"model": config["prompt_model"], "kind": "generate_alt_video_prompt_draft"})
-    response = client.models.generate_content(model=config["prompt_model"], contents=draft_contents)
-    draft_text = response_text(response)
-    if not draft_text:
+    append_transcript(run_dir, "llm_request", {"model": llm_model, "kind": "generate_alt_video_prompt_draft"})
+    response = llm.generate_content(
+        model=llm_model,
+        contents=draft_contents,
+        config={"response_mime_type": "application/json"},
+    )
+    draft_raw = llm.extract_text(response)
+    if not draft_raw:
         raise RuntimeError("Empty video prompt response.")
-    current_prompt = draft_text.strip()
+    draft_data = json.loads(draft_raw)
+    current_prompt = str(draft_data.get("video_prompt", "")).strip()
+    contract = draft_data.get("consistency_contract") or {}
+    if not current_prompt:
+        raise RuntimeError("Draft prompt JSON missing video_prompt.")
+    write_json(contract_path, contract)
 
     critique_rounds = []
     accepted_round = None
@@ -1173,19 +1249,19 @@ def generate_alt_video_prompt(run_dir, *, force=False):
 
     for round_idx in range(1, 4):
         critique_instruction = """
-You are reviewing a product video prompt for operation-risk.
+You are reviewing a product video prompt for execution-risk.
 
 Goal:
 - Keep the prompt product-agnostic and showcase-first.
-- Avoid any operation/manipulation/state-change actions on the product.
-
-Score operation risk from 0-100:
-- 0 means safe showcase-only wording.
-- 100 means high risk that the model will fail on product operation actions.
+- Preserve spatial/orientation consistency from selected references.
+- Avoid operation/manipulation/state-change actions on the product.
 
 Return strict JSON only:
 {
   "operation_risk": 0,
+  "spatial_orientation_risk": 0,
+  "mirror_risk": 0,
+  "identity_drift_risk": 0,
   "issues": ["string"],
   "safe_rewrite": "string"
 }
@@ -1195,23 +1271,33 @@ Return strict JSON only:
             f"User description:\n{config['description']}",
             f"Scenario brief JSON:\n{json.dumps(scenario, ensure_ascii=False)}",
             f"Selected top-3 JSON:\n{json.dumps(selected, ensure_ascii=False)}",
+            f"Consistency contract JSON:\n{json.dumps(contract, ensure_ascii=False)}",
+            "Selected reference image 1:",
+            build_inline_image_part(selected_images[0]),
+            "Selected reference image 2:",
+            build_inline_image_part(selected_images[1]),
+            "Selected reference image 3:",
+            build_inline_image_part(selected_images[2]),
             f"Current prompt:\n{current_prompt}",
         ]
         append_transcript(
             run_dir,
             "llm_request",
-            {"model": config["prompt_model"], "kind": "generate_alt_video_prompt_critique", "round": round_idx, "prompt": current_prompt},
+            {"model": llm_model, "kind": "generate_alt_video_prompt_critique", "round": round_idx, "prompt": current_prompt},
         )
-        critique_response = client.models.generate_content(
-            model=config["prompt_model"],
+        critique_response = llm.generate_content(
+            model=llm_model,
             contents=critique_contents,
             config={"response_mime_type": "application/json"},
         )
-        critique_raw = response_text(critique_response)
+        critique_raw = llm.extract_text(critique_response)
         if not critique_raw:
             raise RuntimeError("Prompt critique returned empty response.")
         critique_data = json.loads(critique_raw)
         operation_risk = max(0, min(100, int(critique_data.get("operation_risk", 100))))
+        spatial_orientation_risk = max(0, min(100, int(critique_data.get("spatial_orientation_risk", 100))))
+        mirror_risk = max(0, min(100, int(critique_data.get("mirror_risk", 100))))
+        identity_drift_risk = max(0, min(100, int(critique_data.get("identity_drift_risk", 100))))
         issues = critique_data.get("issues") or []
         if not isinstance(issues, list):
             issues = [str(issues)]
@@ -1221,13 +1307,22 @@ Return strict JSON only:
             {
                 "round": round_idx,
                 "operation_risk": operation_risk,
+                "spatial_orientation_risk": spatial_orientation_risk,
+                "mirror_risk": mirror_risk,
+                "identity_drift_risk": identity_drift_risk,
                 "issues": [str(item) for item in issues],
                 "prompt_in": current_prompt,
                 "safe_rewrite": safe_rewrite,
             }
         )
 
-        if operation_risk <= risk_threshold and current_prompt:
+        if (
+            operation_risk <= risk_threshold
+            and spatial_orientation_risk <= risk_threshold
+            and mirror_risk <= risk_threshold
+            and identity_drift_risk <= risk_threshold
+            and current_prompt
+        ):
             accepted_round = round_idx
             break
 
@@ -1241,15 +1336,18 @@ Rules:
 - No operation/manipulation/state-change actions on product.
 - Keep cinematic showcase style: framing, camera movement, lighting, detail emphasis.
 - Preserve product identity and premium impact.
+- Preserve orientation and asymmetry markers from the consistency contract.
+- No mirror/flip/left-right swap transforms.
 - Return plain text only.
 """.strip()
             rewrite_contents = [
                 rewrite_instruction,
+                f"Consistency contract JSON:\n{json.dumps(contract, ensure_ascii=False)}",
                 f"Current prompt:\n{current_prompt}",
                 f"Critique issues:\n{json.dumps(issues, ensure_ascii=False)}",
             ]
-            rewrite_response = client.models.generate_content(model=config["prompt_model"], contents=rewrite_contents)
-            rewrite_text = response_text(rewrite_response)
+            rewrite_response = llm.generate_content(model=llm_model, contents=rewrite_contents)
+            rewrite_text = llm.extract_text(rewrite_response)
             if rewrite_text:
                 current_prompt = rewrite_text.strip()
 
@@ -1260,9 +1358,10 @@ Rules:
     write_json(
         review_path,
         {
-            "model": config["prompt_model"],
+            "model": llm_model,
             "risk_threshold": risk_threshold,
             "accepted_round": accepted_round,
+            "consistency_contract": contract,
             "rounds": critique_rounds,
             "final_prompt": final_prompt,
         },
@@ -1271,9 +1370,10 @@ Rules:
     write_json(
         meta_path,
         {
-            "model": config["prompt_model"],
+            "model": llm_model,
             "prompt": final_prompt,
             "review_path": str(review_path),
+            "contract_path": str(contract_path),
             "accepted_round": accepted_round,
         },
     )
@@ -1281,11 +1381,11 @@ Rules:
         run_dir,
         "llm_response",
         {
-            "model": config["prompt_model"],
+            "model": llm_model,
             "kind": "generate_alt_video_prompt",
             "text": final_prompt,
             "accepted_round": accepted_round,
-            "operation_risk_final": critique_rounds[-1]["operation_risk"] if critique_rounds else None,
+            "final_risks": critique_rounds[-1] if critique_rounds else None,
         },
     )
     state = update_run_state(
@@ -1298,6 +1398,7 @@ Rules:
         "status": "generated",
         "prompt_path": str(prompt_path),
         "meta_path": str(meta_path),
+        "contract_path": str(contract_path),
         "review_path": str(review_path),
         "prompt": final_prompt,
         "run_state": state,
@@ -1308,55 +1409,222 @@ def _build_video_reference_image(path):
     return types.VideoGenerationReferenceImage(image=build_image(path), reference_type="asset")
 
 
-def generate_alt_8s_video(run_dir, *, force=False):
+def _extract_all_video_outputs(operation):
+    response = getattr(operation, "response", None)
+    if response is None and isinstance(operation, dict):
+        response = operation.get("response")
+    if response is None:
+        raise RuntimeError("Generation finished but no response payload was returned.")
+    generated = getattr(response, "generated_videos", None)
+    if generated is None and isinstance(response, dict):
+        generated = response.get("generated_videos") or response.get("generatedVideos")
+    if not generated:
+        raise RuntimeError("Generation finished but no videos were returned.")
+    outputs = []
+    for item in generated:
+        video = getattr(item, "video", None)
+        if video is None and isinstance(item, dict):
+            video = item.get("video")
+        if video is not None:
+            outputs.append(video)
+    if not outputs:
+        raise RuntimeError("No video payloads found in generated videos response.")
+    return outputs
+
+
+def _score_alt_video_candidate(run_dir, config, candidate_path, selected_images, contract):
+    llm, llm_model = _llm_for(config, "qa")
+    instruction = """
+Evaluate this generated product promo video against selected reference images.
+
+Score 0-100 for:
+- product_match
+- impact
+- spatial_orientation_consistency
+- visual_quality
+
+Score mirror_violation as 0 or 100:
+- 0 if no mirror/side-swap issue
+- 100 if mirrored/side-swapped orientation appears
+
+Return strict JSON:
+{
+  "product_match": 0,
+  "impact": 0,
+  "spatial_orientation_consistency": 0,
+  "visual_quality": 0,
+  "mirror_violation": 0,
+  "reason": "string"
+}
+""".strip()
+    contents = [
+        instruction,
+        f"User description:\n{config['description']}",
+        f"Consistency contract JSON:\n{json.dumps(contract, ensure_ascii=False)}",
+        "Reference image 1:",
+        build_inline_image_part(selected_images[0]),
+        "Reference image 2:",
+        build_inline_image_part(selected_images[1]),
+        "Reference image 3:",
+        build_inline_image_part(selected_images[2]),
+        "Candidate video:",
+        build_inline_image_part(candidate_path),
+    ]
+    response = llm.generate_content(
+        model=llm_model,
+        contents=contents,
+        config={"response_mime_type": "application/json"},
+    )
+    raw = llm.extract_text(response)
+    if not raw:
+        raise RuntimeError(f"Empty video QA response for {candidate_path}.")
+    data = json.loads(raw)
+    for key in ["product_match", "impact", "spatial_orientation_consistency", "visual_quality"]:
+        data[key] = max(0, min(100, int(data.get(key, 0))))
+    data["mirror_violation"] = 100 if int(data.get("mirror_violation", 0)) >= 50 else 0
+    data["reason"] = str(data.get("reason", "")).strip()
+    return data
+
+
+def generate_alt_8s_video(run_dir, *, force=False, candidate_count=3):
     run_dir = Path(run_dir)
     config = load_json(run_dir / "config.json")
     selected = load_json(run_dir / "alt_selected_top3.json")
     prompt_path = run_dir / "alt_video_prompt.txt"
+    contract_path = run_dir / "alt_video_prompt_contract.json"
     output_path = run_dir / "alt_final_8s.mp4"
+    qa_path = run_dir / "alt_video_qa.json"
+    candidates_dir = run_dir / "alt_video_candidates"
     if should_skip_output(output_path, force):
         state = update_run_state(run_dir)
         return {"status": "skipped", "path": str(output_path), "run_state": state}
     if not prompt_path.is_file():
         raise FileNotFoundError(f"Missing alt video prompt: {prompt_path}")
+    contract = load_json(contract_path) if contract_path.is_file() else {}
     prompt = prompt_path.read_text(encoding="utf-8").strip()
     selected_images = [item["path"] for item in selected.get("selected", [])]
     if len(selected_images) != 3:
         raise RuntimeError("alt_selected_top3.json must contain exactly 3 selected images.")
     for path in selected_images:
         require_file(path)
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    if candidate_count < 1:
+        raise ValueError("candidate_count must be >= 1")
+    effective_prompt = (
+        prompt
+        + " Preserve orientation/asymmetry from references. No mirror, no horizontal flip, no left-right side swap."
+    )
 
     client = build_client(config["project_id"], config["location"])
-    append_transcript(run_dir, "llm_request", {"model": config["video_model"], "kind": "generate_alt_8s_video", "reference_images": selected_images})
+    append_transcript(
+        run_dir,
+        "llm_request",
+        {
+            "model": config["video_model"],
+            "kind": "generate_alt_8s_video",
+            "reference_images": selected_images,
+            "candidate_count": candidate_count,
+        },
+    )
 
-    def _call():
-        return client.models.generate_videos(
-            model=config["video_model"],
-            prompt=prompt,
-            config=types.GenerateVideosConfig(
-                reference_images=[_build_video_reference_image(path) for path in selected_images],
-                duration_seconds=8,
-                aspect_ratio=config["aspect_ratio"],
-                number_of_videos=1,
-                generate_audio=False,
-                resolution="1080p",
-            ),
+    candidate_paths = []
+    for idx in range(1, candidate_count + 1):
+        candidate_path = candidates_dir / f"candidate_{idx}.mp4"
+        candidate_paths.append(candidate_path)
+        if should_skip_output(candidate_path, force):
+            continue
+
+        def _call():
+            return client.models.generate_videos(
+                model=config["video_model"],
+                prompt=f"{effective_prompt} Variation {idx}.",
+                config=types.GenerateVideosConfig(
+                    reference_images=[_build_video_reference_image(path) for path in selected_images],
+                    duration_seconds=8,
+                    aspect_ratio=config["aspect_ratio"],
+                    number_of_videos=1,
+                    generate_audio=False,
+                    resolution="1080p",
+                ),
+            )
+
+        operation = call_with_retry(_call, retries=4, initial_delay=20.0)
+        operation = poll_operation(client, operation)
+        error_obj = getattr(operation, "error", None)
+        if error_obj:
+            message = getattr(error_obj, "message", str(error_obj))
+            append_transcript(run_dir, "llm_response", {"model": config["video_model"], "kind": "generate_alt_8s_video_candidate", "candidate": idx, "error": message})
+            raise RuntimeError(f"Veo generation failed on candidate {idx}: {message}")
+        payloads = _extract_all_video_outputs(operation)
+        save_video_payload(payloads[0], candidate_path)
+
+    weights = {
+        "product_match": 0.40,
+        "impact": 0.20,
+        "spatial_orientation_consistency": 0.30,
+        "visual_quality": 0.10,
+        "mirror_violation": -0.40,
+    }
+    qa_scores = []
+    for idx, path in enumerate(candidate_paths, start=1):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing generated candidate video: {path}")
+        score = _score_alt_video_candidate(run_dir, config, path, selected_images, contract)
+        total = round(
+            score["product_match"] * weights["product_match"]
+            + score["impact"] * weights["impact"]
+            + score["spatial_orientation_consistency"] * weights["spatial_orientation_consistency"]
+            + score["visual_quality"] * weights["visual_quality"]
+            + score["mirror_violation"] * weights["mirror_violation"],
+            2,
         )
-
-    operation = call_with_retry(_call, retries=4, initial_delay=20.0)
-    operation = poll_operation(client, operation)
-    error_obj = getattr(operation, "error", None)
-    if error_obj:
-        message = getattr(error_obj, "message", str(error_obj))
-        append_transcript(run_dir, "llm_response", {"model": config["video_model"], "kind": "generate_alt_8s_video", "error": message})
-        raise RuntimeError(f"Veo generation failed: {message}")
-    video_payload = extract_video_output(operation)
-    save_video_payload(video_payload, output_path)
-    append_transcript(run_dir, "llm_response", {"model": config["video_model"], "kind": "generate_alt_8s_video", "output_path": str(output_path)})
+        qa_scores.append(
+            {
+                "candidate": idx,
+                "path": str(path),
+                "product_match": score["product_match"],
+                "impact": score["impact"],
+                "spatial_orientation_consistency": score["spatial_orientation_consistency"],
+                "visual_quality": score["visual_quality"],
+                "mirror_violation": score["mirror_violation"],
+                "total": total,
+                "reason": score["reason"],
+            }
+        )
+    qa_scores.sort(key=lambda item: item["total"], reverse=True)
+    best = qa_scores[0]
+    output_path.write_bytes(Path(best["path"]).read_bytes())
+    write_json(
+        qa_path,
+        {
+            "weights": weights,
+            "scores": qa_scores,
+            "selected": best,
+            "prompt": effective_prompt,
+        },
+    )
+    append_transcript(
+        run_dir,
+        "llm_response",
+        {
+            "model": config["video_model"],
+            "kind": "generate_alt_8s_video",
+            "output_path": str(output_path),
+            "selected_candidate": best["candidate"],
+            "qa_path": str(qa_path),
+        },
+    )
     state = update_run_state(
         run_dir,
         state="ALT_VIDEO_READY",
         last_completed_step="promo_alt_generate_8s_video",
         last_error={"failed_step": None, "error_type": None, "error_message": None, "retryable": False},
     )
-    return {"status": "generated", "path": str(output_path), "duration_seconds": ffprobe_duration(output_path), "run_state": state}
+    return {
+        "status": "generated",
+        "path": str(output_path),
+        "duration_seconds": ffprobe_duration(output_path),
+        "qa_path": str(qa_path),
+        "selected_candidate": best["candidate"],
+        "run_state": state,
+    }

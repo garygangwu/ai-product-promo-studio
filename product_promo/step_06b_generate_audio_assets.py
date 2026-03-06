@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_product_promo.workflow import generate_audio_assets
+from product_promo.workflow import generate_audio_assets
 
 
 def parse_args():

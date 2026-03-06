@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_product_promo.workflow import generate_alt_video_prompt
+from product_promo.workflow import generate_alt_video_prompt
 
 
 def parse_args():
@@ -20,10 +20,12 @@ def main():
     if result["status"] == "skipped":
         print(f"Skipping existing {result['prompt_path']}")
         print(f"Skipping existing {result['meta_path']}")
+        print(f"Skipping existing {result['contract_path']}")
         print(f"Skipping existing {result['review_path']}")
     else:
         print(f"Wrote {result['prompt_path']}")
         print(f"Wrote {result['meta_path']}")
+        print(f"Wrote {result['contract_path']}")
         print(f"Wrote {result['review_path']}")
 
 

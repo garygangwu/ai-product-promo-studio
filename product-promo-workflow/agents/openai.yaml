@@ -1,0 +1,4 @@
+interface:
+  display_name: "Product Promo Workflow"
+  short_description: "Operate the promo MCP workflow and recover runs safely"
+  default_prompt: "Use $product-promo-workflow to create, resume, inspect, or repair a product promo run while preserving resumable artifacts."

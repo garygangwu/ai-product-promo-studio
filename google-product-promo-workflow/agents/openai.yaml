@@ -1,4 +1,0 @@
-interface:
-  display_name: "Google Product Promo"
-  short_description: "Operate the promo MCP workflow and recover runs safely"
-  default_prompt: "Use $google-product-promo-workflow to create, resume, inspect, or repair a product promo run while preserving resumable artifacts."

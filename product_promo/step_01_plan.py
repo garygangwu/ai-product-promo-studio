@@ -4,13 +4,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from google_product_promo.common import (
+from product_promo.common import (
     DEFAULT_ASPECT_RATIO,
     DEFAULT_AUDIO_THEME,
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
-from google_product_promo.workflow import create_run
+from product_promo.workflow import create_run
 
 
 def parse_args():
@@ -23,6 +23,11 @@ def parse_args():
     parser.add_argument("--description", required=True)
     parser.add_argument("--aspect-ratio", default=DEFAULT_ASPECT_RATIO)
     parser.add_argument("--audio-theme", default=DEFAULT_AUDIO_THEME)
+    parser.add_argument("--llm-provider", default="openai", choices=["google", "openai"])
+    parser.add_argument("--llm-provider-prompt", default=None, choices=["google", "openai"])
+    parser.add_argument("--llm-provider-qa", default=None, choices=["google", "openai"])
+    parser.add_argument("--llm-model-prompt", default="gpt-5", help="Prompt/QA model (default: gpt-5).")
+    parser.add_argument("--llm-model-qa", default=None, help="Optional QA model override.")
     return parser.parse_args()
 
 
@@ -37,6 +42,11 @@ def main():
         description=args.description,
         aspect_ratio=args.aspect_ratio,
         audio_theme=args.audio_theme,
+        llm_provider=args.llm_provider,
+        llm_model_prompt=args.llm_model_prompt,
+        llm_provider_prompt=args.llm_provider_prompt,
+        llm_provider_qa=args.llm_provider_qa,
+        llm_model_qa=args.llm_model_qa,
     )
     print(f"Run dir: {result['run_dir']}")
     print(f"Prompt model: {result['config']['prompt_model']}")
